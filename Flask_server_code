@@ -1,0 +1,152 @@
+Flask server code
+
+
+
+
+
+from flask import Flask, request, jsonify
+import numpy as np
+import cv2
+import mediapipe as mp
+
+app = Flask(__name__)
+
+# ===== MediaPipe Setup =====
+BaseOptions = mp.tasks.BaseOptions
+HandLandmarker = mp.tasks.vision.HandLandmarker
+HandLandmarkerOptions = mp.tasks.vision.HandLandmarkerOptions
+VisionRunningMode = mp.tasks.vision.RunningMode
+
+options = HandLandmarkerOptions(
+    base_options=BaseOptions(model_asset_path='hand_landmarker.task'),
+    running_mode=VisionRunningMode.IMAGE,
+    num_hands=1
+)
+
+landmarker = HandLandmarker.create_from_options(options)
+
+GESTURE_MAP = {
+    "thumbs_up": "Good",
+    "open_palm": "Hello",
+    "fist": "Stop",
+    "peace": "Peace",
+    "pointing_up": "One",
+    "rock": "Rock"
+}
+
+latest_gesture = ""
+
+# ===== Gesture Logic =====
+def classify_gesture(lm):
+    thumb_up  = lm[4].x < lm[3].x if lm[17].x > lm[5].x else lm[4].x > lm[3].x
+    index_up  = lm[8].y  < lm[6].y
+    middle_up = lm[12].y < lm[10].y
+    ring_up   = lm[16].y < lm[14].y
+    pinky_up  = lm[20].y < lm[18].y
+
+    fingers = [thumb_up, index_up, middle_up, ring_up, pinky_up]
+
+    if fingers == [False]*5: return "fist"
+    if fingers == [True]*5:  return "open_palm"
+    if fingers == [True,False,False,False,False]: return "thumbs_up"
+    if fingers == [False,True,False,False,False]: return "pointing_up"
+    if fingers == [False,True,True,False,False]: return "peace"
+    if fingers == [False,True,False,False,True]: return "rock"
+
+    return "unknown"
+
+
+# ===== API: ESP32 sends image =====
+@app.route('/predict', methods=['POST'])
+def predict():
+    global latest_gesture
+
+    img_bytes = np.frombuffer(request.data, np.uint8)
+    img = cv2.imdecode(img_bytes, cv2.IMREAD_COLOR)
+
+    if img is None:
+        return jsonify({"gesture": ""})
+
+    img = cv2.resize(img, (320, 240))
+    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=img_rgb)
+    result = landmarker.detect(mp_image)
+
+    if result.hand_landmarks:
+        gesture = classify_gesture(result.hand_landmarks[0])
+
+        if gesture != "unknown":
+            text = GESTURE_MAP.get(gesture)
+            latest_gesture = text
+
+            print("Detected:", text)
+            return jsonify({"gesture": text})
+
+    return jsonify({"gesture": ""})
+
+
+# ===== API: get latest gesture =====
+@app.route('/latest', methods=['GET'])
+def latest():
+    return latest_gesture
+
+
+# ===== PHONE SPEAKER PAGE =====
+@app.route('/speak')
+def speak():
+    return '''
+    <html>
+    <body style="font-size:40px; text-align:center;">
+    <h2>Gesture Speaker 🔊</h2>
+
+    <button onclick="start()" style="font-size:30px;">Start 🔊</button>
+
+    <h1 id="text">Waiting...</h1>
+
+    <script>
+    let last = "";
+    let started = false;
+
+    function start() {
+        started = true;
+
+        // 🔥 unlock audio
+        let msg = new SpeechSynthesisUtterance("Started");
+        speechSynthesis.speak(msg);
+
+        poll();
+    }
+
+    async function poll() {
+        if (!started) return;
+
+        try {
+            let res = await fetch('/latest');
+            let text = await res.text();
+
+            if (text !== "" && text !== last) {
+                last = text;
+
+                let msg = new SpeechSynthesisUtterance(text);
+                msg.rate = 1;
+                msg.pitch = 1;
+                msg.volume = 1;
+
+                speechSynthesis.speak(msg);
+
+                document.getElementById("text").innerText = text;
+            }
+        } catch(e) {}
+
+        setTimeout(poll, 800);
+    }
+    </script>
+
+    </body>
+    </html>
+    '''
+
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5001)
